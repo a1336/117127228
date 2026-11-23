@@ -8,6 +8,7 @@ import json
 import math
 import os
 import random
+import shutil
 import sys
 import time
 import traceback
@@ -45,7 +46,7 @@ class Config:
     MAX_TOWERS = 40
     MAX_PICKUPS = 70
     MAX_BEAMS = 24
-    FPS = 60
+    FPS = 120
     MAX_DT = 0.05
     SAVE_NAME = "savegame.json"
     LOG_NAME = "game_error.log"
@@ -146,6 +147,7 @@ class TextRenderer:
 
     def __init__(self):
         self.cache = {}
+        self.surf_cache = {}
         self.cjk_path = find_cjk_font()
 
     def font(self, size):
@@ -166,20 +168,37 @@ class TextRenderer:
                 self.cache[size] = f
         return f
 
-    def draw(self, surf, text, size, color, pos, anchor="topleft", shadow=False):
+    def _img(self, text, size, color):
+        key = (text, int(size), color)
+        img = self.surf_cache.get(key)
+        if img is not None:
+            return img
         f = self.font(size)
         if f is None:
             return None
-        text = str(text)
         img = f.render(text, True, color)
+        if len(self.surf_cache) >= 500:
+            try:
+                self.surf_cache.pop(next(iter(self.surf_cache)))
+            except Exception:
+                self.surf_cache.clear()
+        self.surf_cache[key] = img
+        return img
+
+    def draw(self, surf, text, size, color, pos, anchor="topleft", shadow=False):
+        text = str(text)
+        img = self._img(text, size, color)
+        if img is None:
+            return None
         rect = img.get_rect()
         try:
             setattr(rect, anchor, (int(pos[0]), int(pos[1])))
         except Exception:
             rect.topleft = (int(pos[0]), int(pos[1]))
         if shadow:
-            sh = f.render(text, True, (0, 0, 0))
-            surf.blit(sh, (rect.x + 2, rect.y + 2))
+            sh = self._img(text, size, (0, 0, 0))
+            if sh is not None:
+                surf.blit(sh, (rect.x + 2, rect.y + 2))
         surf.blit(img, rect)
         return rect
 
@@ -295,20 +314,38 @@ class AudioManager:
 # 存档
 # =====================================================================
 class SaveManager:
+    """两层存档：savegame.json 存设置/最高纪录/排行榜，run_save.json 存当前局。
+    写入采用临时文件 + fsync + 原子替换，并保留 .bak 备份。"""
+
     def __init__(self):
         self.dir = self._pick_dir()
         self.path = os.path.join(self.dir, Config.SAVE_NAME)
+        self.run_path = os.path.join(self.dir, "run_save.json")
+        self.last_error = ""
         self.data = self._default()
         self.load()
 
     def _pick_dir(self):
+        # Android APK 里 __file__ 在解包目录，可能随启动被重写；
+        # p4a 的 ANDROID_PRIVATE 才是稳定的应用私有目录，必须优先。
         cands = []
+        for key in ("ANDROID_PRIVATE",):
+            try:
+                v = os.environ.get(key)
+                if v:
+                    cands.append(v)
+            except Exception:
+                pass
         try:
             cands.append(os.path.dirname(os.path.abspath(__file__)))
         except Exception:
             pass
         try:
             cands.append(os.getcwd())
+        except Exception:
+            pass
+        try:
+            cands.append(os.path.expanduser("~"))
         except Exception:
             pass
         for d in cands:
@@ -318,6 +355,7 @@ class SaveManager:
                 probe = os.path.join(d, ".sm_write_test")
                 with open(probe, "w", encoding="utf-8") as f:
                     f.write("ok")
+                    f.flush()
                 os.remove(probe)
                 return d
             except Exception:
@@ -326,7 +364,7 @@ class SaveManager:
 
     def _default(self):
         return {
-            "version": 1,
+            "version": 2,
             "best_wave": 0,
             "best_kills": 0,
             "total_ore": 0,
@@ -337,18 +375,28 @@ class SaveManager:
                 "joystick": 1.0,
                 "show_fps": True,
                 "debug": False,
+                "fps_cap": 120,
             },
             "leaderboard": [],
         }
 
-    def load(self):
+    def _read_json(self, path):
         try:
-            if not os.path.exists(self.path):
-                return
-            with open(self.path, "r", encoding="utf-8") as f:
+            with open(path, "r", encoding="utf-8") as f:
                 raw = json.load(f)
-            if not isinstance(raw, dict):
-                raise ValueError("bad save")
+            if isinstance(raw, dict):
+                return raw
+        except Exception:
+            pass
+        return None
+
+    def load(self):
+        raw = self._read_json(self.path)
+        if raw is None:
+            raw = self._read_json(self.path + ".bak")
+        if raw is None:
+            return
+        try:
             base = self._default()
             for k in ("best_wave", "best_kills", "total_ore"):
                 v = raw.get(k)
@@ -361,14 +409,16 @@ class SaveManager:
                     v = st.get(k)
                     if isinstance(v, (int, float)) and not isinstance(v, bool):
                         s[k] = float(v)
-                for k in ("quality",):
-                    v = st.get(k)
-                    if isinstance(v, int) and not isinstance(v, bool):
-                        s[k] = int(clamp(v, 0, 1))
+                v = st.get("quality")
+                if isinstance(v, int) and not isinstance(v, bool):
+                    s["quality"] = int(clamp(v, 0, 1))
                 for k in ("show_fps", "debug"):
                     v = st.get(k)
                     if isinstance(v, bool):
                         s[k] = v
+                v = st.get("fps_cap")
+                if isinstance(v, int) and not isinstance(v, bool) and v in (60, 90, 120):
+                    s["fps_cap"] = v
                 s["volume"] = clamp(s["volume"], 0.0, 1.0)
                 s["particles"] = clamp(s["particles"], 0.4, 1.0)
                 s["joystick"] = clamp(s["joystick"], 0.8, 1.2)
@@ -389,20 +439,61 @@ class SaveManager:
         except Exception:
             self.data = self._default()
 
-    def save(self):
+    def _atomic_write(self, path, payload):
+        tmp = path + ".tmp"
         try:
-            tmp = self.path + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(self.data, f, ensure_ascii=False)
-            os.replace(tmp, self.path)
+                json.dump(payload, f, ensure_ascii=False, separators=(",", ":"))
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except Exception:
+                    pass
+            if os.path.exists(path):
+                try:
+                    shutil.copyfile(path, path + ".bak")
+                except Exception:
+                    pass
+            os.replace(tmp, path)
             return True
-        except Exception:
+        except Exception as e:
+            self.last_error = str(e)
             try:
-                with open(self.path, "w", encoding="utf-8") as f:
-                    json.dump(self.data, f, ensure_ascii=False)
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(payload, f, ensure_ascii=False, separators=(",", ":"))
                 return True
-            except Exception:
+            except Exception as e2:
+                self.last_error = str(e2)
                 return False
+
+    def save(self):
+        return self._atomic_write(self.path, self.data)
+
+    def save_run(self, payload):
+        return self._atomic_write(self.run_path, payload)
+
+    def load_run(self):
+        raw = self._read_json(self.run_path)
+        if raw is None:
+            raw = self._read_json(self.run_path + ".bak")
+        return raw
+
+    def clear_run(self):
+        for p in (self.run_path, self.run_path + ".bak", self.run_path + ".tmp"):
+            try:
+                if os.path.exists(p):
+                    os.remove(p)
+            except Exception:
+                pass
+
+    def has_run(self):
+        for path in (self.run_path, self.run_path + ".bak"):
+            try:
+                if os.path.isfile(path) and os.path.getsize(path) > 20:
+                    return True
+            except Exception:
+                pass
+        return False
 
     def add_score(self, wave, kills, secs):
         lb = self.data.get("leaderboard", [])
@@ -1487,6 +1578,7 @@ class WaveManager:
         else:
             self.game.banner("第 %d 波" % self.wave, 2.0)
         self.game.audio.play("wave", 0.6)
+        self.game.save_run_now(False)
 
     def spawn_one(self, kind):
         g = self.game
@@ -1541,6 +1633,7 @@ class WaveManager:
         self.timer = 12.0
         g.banner("第 %d 波已清空  +%d 矿石" % (self.wave, ore), 2.4)
         g.audio.play("upgrade", 0.7)
+        g.save_run_now(False)
 
 
 # =====================================================================
@@ -1690,6 +1783,8 @@ class Game:
             pass
         self.fonts = TextRenderer()
         self.save = SaveManager()
+        self.has_run_save = self.save.has_run()
+        self.autosave_timer = 0.0
         self.settings = self.save.data["settings"]
         self.audio = AudioManager(self.settings.get("volume", 0.25))
         self.state = "menu"
@@ -1839,10 +1934,248 @@ class Game:
 
     def save_all(self):
         try:
+            if (self.player is not None and not self.player.dead
+                    and self.state in ("playing", "paused", "upgrade")):
+                self.save_run_now(False)
             self.save.data["settings"] = dict(self.settings)
             self.save.save()
         except Exception:
             pass
+
+    def save_on_background(self):
+        """切后台/退出时调用：保存本局和设置，尽量不丢进度。"""
+        try:
+            if (self.player is not None and not self.player.dead
+                    and self.state in ("playing", "paused", "upgrade")):
+                self.save_run_now(False)
+            self.save.data["settings"] = dict(self.settings)
+            self.save.save()
+        except Exception:
+            pass
+
+    def pause_game(self):
+        if self.state != "playing":
+            return
+        self.save_run_now(False)
+        self.set_state("paused")
+
+    # ---------------- 本局存档 / 继续游戏 ----------------
+    def snapshot_run(self):
+        p = self.player
+        wm = self.wave_mgr
+        if p is None or self.map is None or self.dead or p.dead:
+            return None
+        try:
+            return {
+                "version": 2,
+                "saved_at": int(time.time()),
+                "seed": int(self.run_seed),
+                "wave": int(wm.wave if wm else 0),
+                "phase": (wm.state if wm else "prep"),
+                "player": {
+                    "x": round(p.x, 2), "y": round(p.y, 2), "angle": round(p.angle, 4),
+                    "max_hp": p.max_hp, "hp": p.hp,
+                    "max_shield": p.max_shield, "shield": p.shield,
+                    "max_energy": p.max_energy, "energy": p.energy,
+                    "weapon": p.weapon,
+                    "weapon_levels": dict(p.weapon_levels),
+                    "dmg_mult": p.dmg_mult, "rate_mult": p.rate_mult,
+                    "speed_mult": p.speed_mult, "crit": p.crit,
+                    "pierce_bonus": p.pierce_bonus, "lifesteal": p.lifesteal,
+                    "explosive": p.explosive, "magnet": p.magnet,
+                    "thorns": p.thorns, "slow_aura": p.slow_aura,
+                    "mine_mult": p.mine_mult, "regen": p.regen,
+                    "xp_mult": p.xp_mult, "dash_cd_max": p.dash_cd_max,
+                },
+                "res": {k: int(v) for k, v in self.res.items()},
+                "kills": int(self.kills),
+                "level": int(self.level),
+                "xp": float(self.xp),
+                "xp_next": float(self.xp_next),
+                "pending": int(self.pending_upgrades),
+                "game_time": round(float(self.game_time), 2),
+                "tower_dmg_mult": self.tower_dmg_mult,
+                "tower_range_mult": self.tower_range_mult,
+                "tower_cost_mult": self.tower_cost_mult,
+                "res_mult": self.res_mult,
+                "towers": [
+                    {"kind": t.kind, "gx": t.gx, "gy": t.gy,
+                     "level": t.level, "hp": t.hp,
+                     "inv_ore": t.invested.get("ore", 0),
+                     "inv_cry": t.invested.get("crystal", 0)}
+                    for t in self.towers if t.alive
+                ],
+                "nodes": [[int(nd.amount), round(float(nd.respawn), 2)] for nd in self.map.nodes],
+            }
+        except Exception:
+            return None
+
+    def save_run_now(self, show=False):
+        snap = self.snapshot_run()
+        if snap is None:
+            return False
+        ok = self.save.save_run(snap)
+        self.has_run_save = bool(ok)
+        if show:
+            self.show_toast("游戏已保存" if ok else "保存失败", 1.6)
+        return ok
+
+    def start_from_snapshot(self, data):
+        try:
+            if not isinstance(data, dict) or int(data.get("version", 0)) < 2:
+                return False
+            seed = int(data.get("seed", 0))
+            self.run_seed = seed
+            self.map = MapGenerator(seed)
+            pd = data.get("player") or {}
+            px = float(pd.get("x", self.map.spawn[0]))
+            py = float(pd.get("y", self.map.spawn[1]))
+            self.player = Player(px, py, self)
+            p = self.player
+            for key in ("max_hp", "hp", "max_shield", "shield", "max_energy", "energy",
+                        "dmg_mult", "rate_mult", "speed_mult", "crit", "lifesteal",
+                        "explosive", "magnet", "thorns", "slow_aura", "mine_mult",
+                        "regen", "xp_mult", "dash_cd_max"):
+                try:
+                    setattr(p, key, float(pd.get(key, getattr(p, key))))
+                except Exception:
+                    pass
+            try:
+                p.pierce_bonus = max(0, int(pd.get("pierce_bonus", p.pierce_bonus)))
+            except Exception:
+                pass
+            if pd.get("weapon") in WEAPONS:
+                p.weapon = pd["weapon"]
+            lv = pd.get("weapon_levels")
+            if isinstance(lv, dict):
+                for k in WEAPON_ORDER:
+                    if k in lv:
+                        try:
+                            p.weapon_levels[k] = min(9, max(1, int(lv[k])))
+                        except Exception:
+                            pass
+            p.max_hp = max(20.0, p.max_hp)
+            p.hp = clamp(p.hp, 1.0, p.max_hp)
+            p.max_shield = max(0.0, p.max_shield)
+            p.shield = clamp(p.shield, 0.0, p.max_shield)
+            p.max_energy = max(0.0, p.max_energy)
+            p.energy = clamp(p.energy, 0.0, p.max_energy)
+            p.x = clamp(px, 22.0, Config.WORLD_W - 22.0)
+            p.y = clamp(py, 22.0, Config.WORLD_H - 22.0)
+            p.dead = False
+            p.firing = False
+            p.invuln = 1.2
+            p.fire_cd = 0.0
+            p.heat = 0.0
+            p.overheated = 0.0
+            p.dash_cd = 0.0
+            p.dash_time = 0.0
+            p.mine_target = None
+            p.mine_progress = 0.0
+
+            self.camera = Camera(self)
+            self.camera.snap(p)
+            self.enemies = []
+            self.bullets = []
+            self.towers = []
+            self.pickups = []
+            self.beams = []
+            self.res = {"ore": 0, "crystal": 0, "core": 0}
+            if isinstance(data.get("res"), dict):
+                for k in self.res:
+                    try:
+                        self.res[k] = max(0, int(data["res"].get(k, 0)))
+                    except Exception:
+                        pass
+            self.kills = max(0, int(data.get("kills", 0)))
+            self.level = max(1, int(data.get("level", 1)))
+            self.xp = max(0.0, float(data.get("xp", 0.0)))
+            self.xp_next = max(1.0, float(data.get("xp_next", 8.0)))
+            self.pending_upgrades = max(0, int(data.get("pending", 0)))
+            self.game_time = max(0.0, float(data.get("game_time", 0.0)))
+            for key in ("tower_dmg_mult", "tower_range_mult", "tower_cost_mult", "res_mult"):
+                try:
+                    setattr(self, key, float(data.get(key, getattr(self, key))))
+                except Exception:
+                    pass
+
+            self.hash_enemies = SpatialHash(110)
+            self.hash_towers = SpatialHash(150)
+            self.particles = ParticleSystem(int(Config.MAX_PARTICLES * self.settings["particles"]))
+            self.dmg_text = DamageTextSystem(Config.MAX_DMGTEXT)
+            self.bullet_pool = ObjectPool(Bullet)
+            self.wave_mgr = WaveManager(self)
+            saved_wave = max(0, int(data.get("wave", 0)))
+            phase = str(data.get("phase", "prep"))
+            if phase == "prep":
+                self.wave_mgr.wave = saved_wave
+                resume_wave = saved_wave + 1
+            else:
+                self.wave_mgr.wave = max(0, saved_wave - 1)
+                resume_wave = saved_wave
+            self.wave_mgr.state = "prep"
+            self.wave_mgr.timer = 8.0
+            self.wave_mgr.queue = []
+            self.wave_mgr.boss_wave = False
+
+            for td in data.get("towers", []):
+                try:
+                    kind = td.get("kind")
+                    if kind not in TOWER_DEFS:
+                        continue
+                    gx = int(td.get("gx", 0))
+                    gy = int(td.get("gy", 0))
+                    tw = Tower(kind, gx, gy, self)
+                    tw.level = int(clamp(int(td.get("level", 1)), 1, 3))
+                    tw.max_hp = TOWER_DEFS[kind]["hp"] * (1.25 ** (tw.level - 1))
+                    tw.hp = clamp(float(td.get("hp", tw.max_hp)), 1.0, tw.max_hp)
+                    tw.invested = {"ore": int(td.get("inv_ore", 0)),
+                                   "crystal": int(td.get("inv_cry", 0))}
+                    self.towers.append(tw)
+                except Exception:
+                    continue
+            states = data.get("nodes")
+            if isinstance(states, list):
+                for nd, st in zip(self.map.nodes, states):
+                    try:
+                        if isinstance(st, (list, tuple)) and len(st) >= 2:
+                            nd.amount = int(clamp(int(st[0]), 0, nd.max_amount))
+                            nd.respawn = max(0.0, float(st[1]))
+                    except Exception:
+                        pass
+
+            self.dead = False
+            self.build_menu = False
+            self.build_kind = None
+            self.selected_tower = None
+            self.upgrade_choices = []
+            self.autosave_timer = 0.0
+            self.has_run_save = True
+            self.set_state("playing")
+            self.apply_settings()
+            self.banner("已读取存档 · 第 %d 波" % max(1, resume_wave), 2.2)
+            self.show_toast("进度已恢复", 2.0)
+            if self.pending_upgrades > 0:
+                self.open_upgrade()
+            return True
+        except Exception:
+            return False
+
+    def continue_run(self):
+        data = self.save.load_run()
+        if not isinstance(data, dict):
+            self.save.clear_run()
+            self.has_run_save = False
+            self.show_toast("没有可用的存档", 1.8)
+            self.build_ui()
+            return False
+        if self.start_from_snapshot(data):
+            return True
+        self.save.clear_run()
+        self.has_run_save = False
+        self.show_toast("存档损坏，已重新开始", 2.0)
+        self.build_ui()
+        return False
 
     def show_toast(self, text, sec=2.2):
         self.toast_text = str(text)
@@ -1865,6 +2198,8 @@ class Game:
 
     # ---------------- 开局 ----------------
     def start_run(self):
+        self.save.clear_run()
+        self.has_run_save = False
         self.new_run()
         self.set_state("playing")
         self.apply_settings()
@@ -1911,6 +2246,8 @@ class Game:
         self.flash_timer = 0.0
         self.banner("第 1 波来袭", 2.2)
         self.show_toast("移动 · 采矿 · 建造 · 生存", 3.0)
+        self.autosave_timer = 0.0
+        self.save_run_now(False)
 
     # ---------------- 输入 ----------------
     def get_joystick_vector(self):
@@ -2025,7 +2362,12 @@ class Game:
     def handle_events(self):
         for e in pygame.event.get():
             if e.type == pygame.QUIT:
+                self.save_on_background()
                 self.running = False
+            elif e.type in (getattr(pygame, "APP_WILLENTERBACKGROUND", -1),
+                            getattr(pygame, "APP_DIDENTERBACKGROUND", -1),
+                            getattr(pygame, "APP_TERMINATING", -1)):
+                self.save_on_background()
             elif e.type == pygame.VIDEORESIZE:
                 try:
                     self.win = pygame.display.set_mode((e.w, e.h), display_flags())
@@ -2059,7 +2401,7 @@ class Game:
         try:
             if k == pygame.K_ESCAPE:
                 if self.state == "playing":
-                    self.set_state("paused")
+                    self.pause_game()
                 elif self.state == "paused":
                     self.set_state("playing")
                 elif self.state in ("settings", "help", "leaderboard"):
@@ -2068,7 +2410,7 @@ class Game:
                     self.running = False
             elif k == pygame.K_p:
                 if self.state == "playing":
-                    self.set_state("paused")
+                    self.pause_game()
                 elif self.state == "paused":
                     self.set_state("playing")
             elif k == pygame.K_b and self.state == "playing" and not self.build_menu:
@@ -2093,6 +2435,9 @@ class Game:
         self.audio.play("ui", 0.45)
         if aid == "start" or aid == "retry":
             self.start_run()
+            return
+        if aid == "continue":
+            self.continue_run()
             return
         if aid == "quit":
             self.save_all()
@@ -2122,18 +2467,22 @@ class Game:
             self.set_state("playing")
             return
         if aid == "menu":
+            if (self.player is not None and not self.player.dead
+                    and self.state in ("playing", "paused", "upgrade")):
+                self.save_run_now(False)
             self.save_settings()
             self.set_state("menu")
             return
         if aid == "save":
             self.save.data["settings"] = dict(self.settings)
             ok = self.save.save()
+            if self.player is not None and not self.player.dead:
+                ok = self.save_run_now(False) and ok
             self.show_toast("已保存" if ok else "保存失败")
             self.audio.play("pickup", 0.6)
             return
         if aid == "pause":
-            if self.state == "playing":
-                self.set_state("paused")
+            self.pause_game()
             return
         if aid == "dash":
             if self.state == "playing" and self.player is not None:
@@ -2196,11 +2545,13 @@ class Game:
                 s["volume"] = clamp(round(s["volume"] + 0.1, 2), 0.0, 1.0)
             self.apply_settings()
             self.build_ui()
+            self.save_settings()
             return
         if aid == "quality":
             self.settings["quality"] = 1 - int(self.settings["quality"])
             self.apply_settings()
             self.build_ui()
+            self.save_settings()
             return
         if aid in ("part_dn", "part_up"):
             s = self.settings
@@ -2210,6 +2561,7 @@ class Game:
                 s["particles"] = clamp(round(s["particles"] + 0.2, 2), 0.4, 1.0)
             self.apply_settings()
             self.build_ui()
+            self.save_settings()
             return
         if aid in ("joy_dn", "joy_up"):
             s = self.settings
@@ -2218,14 +2570,28 @@ class Game:
             else:
                 s["joystick"] = clamp(round(s["joystick"] + 0.1, 2), 0.8, 1.2)
             self.build_ui()
+            self.save_settings()
+            return
+        if aid == "fps_cap":
+            cur = int(self.settings.get("fps_cap", 120))
+            order = [60, 90, 120]
+            try:
+                cur = order[(order.index(cur) + 1) % len(order)]
+            except ValueError:
+                cur = 120
+            self.settings["fps_cap"] = cur
+            self.build_ui()
+            self.save_settings()
             return
         if aid == "fps":
             self.settings["show_fps"] = not bool(self.settings["show_fps"])
             self.build_ui()
+            self.save_settings()
             return
         if aid == "debug":
             self.settings["debug"] = not bool(self.settings["debug"])
             self.build_ui()
+            self.save_settings()
             return
 
     def cycle_weapon(self):
@@ -2350,6 +2716,12 @@ class Game:
             self.camera.update(dt, p)
         if self.wave_mgr is not None:
             self.wave_mgr.update(dt)
+
+        self.autosave_timer += dt
+        if self.autosave_timer >= 15.0:
+            self.autosave_timer = 0.0
+            if self.wave_mgr is not None:
+                self.save_run_now(False)
 
         if p.dead and not self.dead:
             self.finish_run()
@@ -2505,6 +2877,7 @@ class Game:
         self.particles.emit(tw.x, tw.y, 14, TOWER_DEFS[self.build_kind]["color"], speed=110, life=0.5, size=3)
         self.audio.play("build", 0.7)
         self.show_toast(TOWER_DEFS[self.build_kind]["name"] + " 已上线", 1.4)
+        self.save_run_now(False)
 
     def select_tower_at(self, pos):
         wx = pos[0] + self.camera.x - self.camera.ox
@@ -2711,6 +3084,7 @@ class Game:
     def open_upgrade(self):
         if self.state != "playing":
             return
+        self.save_run_now(False)
         self.upgrade_choices = self.upgrade_system.roll(3)
         self.set_state("upgrade")
         self.audio.play("upgrade", 0.9)
@@ -2735,6 +3109,7 @@ class Game:
         else:
             self.state = "playing"
             self.build_ui()
+        self.save_run_now(False)
 
     def on_player_hurt(self, dmg):
         self.camera.add(7.0)
@@ -2754,6 +3129,8 @@ class Game:
             self.save.add_score(wave, self.kills, self.game_time)
         self.save.data["total_ore"] = int(self.save.data.get("total_ore", 0)) + int(self.res.get("ore", 0))
         self.save.save()
+        self.save.clear_run()
+        self.has_run_save = False
         self.set_state("gameover")
         self.audio.play("explode", 1.0)
 
@@ -2773,8 +3150,16 @@ class Game:
         return b
 
     def build_ui(self):
-        self.ui = []
         st = self.state
+        sig = (st, self.LW, self.LH, getattr(self, "build_menu", False),
+               id(self.selected_tower) if getattr(self, "selected_tower", None) is not None else None,
+               self.wave_mgr.state if getattr(self, "wave_mgr", None) is not None else None,
+               self.has_run_save,
+               tuple(sorted(self.settings.items())) if st == "settings" else None)
+        if sig == getattr(self, "ui_sig", None):
+            return
+        self.ui_sig = sig
+        self.ui = []
         if st == "menu":
             self.ui_menu()
         elif st == "settings":
@@ -2819,11 +3204,21 @@ class Game:
         w = min(320, self.LW - 70)
         x = (self.LW - w) // 2
         short, ts, ty, sub, tag, best, y, h, gap = self.menu_layout()
-        self.add_rect("start", "开始游戏", (x, y, w, h), 24 if not short else 21, "primary")
-        self.add_rect("rank", "排行榜", (x, y + (h + gap), w, h), 20 if not short else 18, "ghost")
-        self.add_rect("settings", "设置", (x, y + (h + gap) * 2, w, h), 20 if not short else 18, "ghost")
-        self.add_rect("help", "玩法说明", (x, y + (h + gap) * 3, w, h), 20 if not short else 18, "ghost")
-        self.add_rect("quit", "退出", (x, y + (h + gap) * 4, w, h), 20 if not short else 18, "danger")
+        items = []
+        if self.has_run_save:
+            h = 36 if short else 42
+            gap = 5 if short else 6
+            items.append(("continue", "继续游戏", "good"))
+            items.append(("start", "新游戏", "primary"))
+        else:
+            items.append(("start", "开始游戏", "primary"))
+        items.append(("rank", "排行榜", "ghost"))
+        items.append(("settings", "设置", "ghost"))
+        items.append(("help", "玩法说明", "ghost"))
+        items.append(("quit", "退出", "danger"))
+        for i, (aid, label, style) in enumerate(items):
+            size = (21 if short else 23) if aid in ("continue", "start") else (18 if short else 20)
+            self.add_rect(aid, label, (x, y + i * (h + gap), w, h), size, style)
 
     def settings_row(self, i):
         return 64 + i * 44
@@ -2831,7 +3226,7 @@ class Game:
     def ui_settings(self):
         s = self.settings
         lw = self.LW
-        for i, key in enumerate(("volume", "quality", "particles", "joystick", "fps", "debug")):
+        for i, key in enumerate(("volume", "quality", "particles", "joystick", "fps_cap", "fps", "debug")):
             y = self.settings_row(i)
             if key in ("volume", "particles", "joystick"):
                 self.add_rect(key + "_dn", "-", (lw - 176, y, 36, 30), 22, "ghost")
@@ -2846,6 +3241,8 @@ class Game:
             elif key == "quality":
                 label = "低" if int(s["quality"]) == 0 else "高"
                 self.add_rect("quality", label, (lw - 176, y, 156, 30), 17, "ghost")
+            elif key == "fps_cap":
+                self.add_rect("fps_cap", "%d 帧" % int(s.get("fps_cap", 120)), (lw - 176, y, 156, 30), 17, "ghost")
             elif key == "fps":
                 self.add_rect("fps", "开" if s["show_fps"] else "关", (lw - 176, y, 156, 30), 17, "ghost")
             elif key == "debug":
@@ -3041,7 +3438,7 @@ class Game:
     def draw_settings(self):
         c = self.canvas
         self.fonts.draw(c, "设置", 30, C_CYAN, (self.LW // 2, 20), "midtop", True)
-        labels = ["音量", "画质", "粒子", "摇杆", "显示帧率", "调试信息"]
+        labels = ["音量", "画质", "粒子", "摇杆", "帧率上限", "显示帧率", "调试信息"]
         for i, lab in enumerate(labels):
             self.fonts.draw(c, lab, 18, C_TEXT, (22, self.settings_row(i) + 15), "midleft")
         self.fonts.draw(c, "低画质在手机上更流畅", 12, C_DIM,
@@ -3443,7 +3840,7 @@ class Game:
         c = self.canvas
         c.blit(self.dim, (0, 0))
         self.fonts.draw(c, "已暂停", 38, C_CYAN, (self.LW // 2, int(self.LH * 0.20)), "midtop", True)
-        self.fonts.draw(c, "保存会记录最高波次与排行榜", 12, C_DIM,
+        self.fonts.draw(c, "进度已自动保存 · 也可手动保存", 12, C_DIM,
                         (self.LW // 2, int(self.LH * 0.20) + 58), "midtop")
 
     def draw_gameover(self):
@@ -3523,7 +3920,10 @@ class Game:
     def run(self):
         while self.running:
             try:
-                dt = self.clock.tick(Config.FPS) / 1000.0
+                cap = int(self.settings.get("fps_cap", Config.FPS))
+                if cap not in (60, 90, 120):
+                    cap = Config.FPS
+                dt = self.clock.tick(cap) / 1000.0
                 if dt < 0.0:
                     dt = 0.0
                 dt = min(dt, Config.MAX_DT)
